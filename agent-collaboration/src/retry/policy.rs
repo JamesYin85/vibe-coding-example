@@ -1,6 +1,22 @@
 //! Retry Policy Configuration
 //!
 //! Provides configurable retry policies with various backoff strategies.
+//!
+//! # Example
+//!
+//! ```rust
+//! use agent_collaboration::retry::{RetryConfig, BackoffStrategy};
+//!
+//! let config = RetryConfig::new()
+//!     .with_max_retries(5)
+//!     .with_base_delay(100)
+//!     .with_max_delay(30_000)
+//!     .with_backoff(BackoffStrategy::ExponentialWithJitter);
+//!
+//! // Calculate delay for each attempt
+//! let delay = config.calculate_delay(1); // First retry
+//! let delay = config.calculate_delay(2); // Second retry
+//! ```
 
 use serde::{Deserialize, Serialize};
 use std::time::Duration;

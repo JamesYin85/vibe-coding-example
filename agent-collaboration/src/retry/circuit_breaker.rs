@@ -1,6 +1,31 @@
 //! Circuit Breaker Pattern
 //!
-//! Provides resilience by preventing cascading failures.
+//! Provides resilience by preventing cascading failures in distributed systems.
+//!
+//! # States
+//!
+//! - **Closed**: Normal operation, requests flow through, failures are counted
+//! - **Open**: Requests are blocked, waiting for reset timeout
+//! - **HalfOpen**: Limited requests allowed to test if the service has recovered
+//!
+//! # Example
+//!
+//! ```rust,no_run
+//! use agent_collaboration::retry::{CircuitBreaker, CircuitBreakerConfig};
+//!
+//! let cb = CircuitBreaker::new(CircuitBreakerConfig {
+//!     failure_threshold: 5,      // Open after 5 failures
+//!     failure_window_secs: 60,   // Within 60 seconds
+//!     reset_timeout_secs: 30,    // Try half-open after 30s
+//!     half_open_max_calls: 3,    // Allow 3 test calls
+//!     half_open_timeout_secs: 10,
+//! });
+//!
+//! if cb.is_call_allowed() {
+//!     // Make your request
+//!     cb.record_success(); // or cb.record_failure()
+//! }
+//! ```
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use tracing::{debug, info, warn};

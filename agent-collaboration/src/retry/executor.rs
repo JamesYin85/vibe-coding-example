@@ -1,6 +1,36 @@
 //! Retry Executor
 //!
-//! Provides retry logic for executing operations with configurable policies.
+//! Provides retry logic for executing async operations with configurable policies.
+//!
+//! # Example
+//!
+//! ```rust
+//! use agent_collaboration::retry::{RetryExecutorBuilder, RetryResult};
+//! use agent_collaboration::error::AgentError;
+//!
+//! # #[tokio::main]
+//! # async fn main() -> Result<(), AgentError> {
+//! let executor = RetryExecutorBuilder::new()
+//!     .max_retries(3)
+//!     .exponential_with_jitter()
+//!     .attempt_timeout(5000)  // 5 second timeout per attempt
+//!     .build();
+//!
+//! let result = executor.execute("fetch_api", || async {
+//!     // Your fallible operation here
+//!     Ok::<_, AgentError>("success")
+//! }).await;
+//!
+//! match result {
+//!     RetryResult::Success(value) => println!("Success: {}", value),
+//!     RetryResult::Failed { error, attempts, .. } => {
+//!         eprintln!("Failed after {} attempts: {}", attempts, error);
+//!     }
+//!     RetryResult::Cancelled => println!("Operation cancelled"),
+//! }
+//! # Ok(())
+//! # }
+//! ```
 
 use crate::error::{AgentError, Result};
 use crate::retry::policy::{BackoffStrategy, RetryConfig, RetryPolicy};
