@@ -56,7 +56,7 @@ pub enum AgentError {
         message: String,
     },
 
-    #[error("Invalid state transition: from '{from}' to '{to}'")]
+    #[error("State transition from '{from}' to '{to}' is not allowed")]
     InvalidStateTransition {
         from: String,
         to: String,
@@ -85,7 +85,7 @@ pub enum AgentError {
         task_id: String,
     },
 
-    #[error("Operation timed out after {duration_ms}ms: {operation}")]
+    #[error("Operation '{operation}' timed out after {duration_ms}ms")]
     Timeout {
         operation: String,
         duration_ms: u64,
@@ -250,6 +250,43 @@ impl AgentError {
         }
     }
 
+    pub fn agent_not_found(agent_id: impl Into<String>) -> Self {
+        Self::AgentNotFound {
+            agent_id: agent_id.into(),
+        }
+    }
+
+    pub fn invalid_input(message: impl Into<String>) -> Self {
+        Self::InvalidInput {
+            message: message.into(),
+        }
+    }
+
+    /// Get suggested recovery action
+    pub fn recovery_suggestion(&self) -> Option<String> {
+        match self {
+            AgentError::Timeout { .. } => Some("Consider increasing timeout or checking system load".to_string()),
+            AgentError::Cancelled { .. } => Some("Check if task was intentionally cancelled".to_string()),
+            AgentError::ChannelError { .. } => Some("Check communication channel status".to_string()),
+            AgentError::CommunicationError { .. } => Some("Verify agent connectivity and retry".to_string()),
+            AgentError::CapabilityNotFound { .. } => Some("Ensure capability is registered".to_string()),
+            AgentError::AgentNotFound { .. } => Some("Verify agent ID is correct".to_string()),
+            AgentError::InvalidStateTransition { .. } => Some("Check state machine configuration".to_string()),
+            AgentError::InvalidInput { .. } => Some("Validate input parameters".to_string()),
+            AgentError::Recoverable { suggestion, .. } => Some(suggestion.clone()),
+            _ => None,
+        }
+    }
+
+    /// Get retry delay if applicable
+    pub fn retry_delay_ms(&self) -> Option<u64> {
+        match self {
+            AgentError::Timeout { duration_ms, .. } => Some(*duration_ms / 2),
+            AgentError::Recoverable { .. } => Some(1000), // Default 1s delay
+            _ => None,
+        }
+    }
+
     pub fn log(&self) {
         match self.category() {
             ErrorCategory::Transient | ErrorCategory::Timeout => {
@@ -299,5 +336,26 @@ mod tests {
 
         let err = AgentError::capability_not_found("test");
         assert!(!err.should_retry());
+    }
+
+    #[test]
+    fn test_recovery_suggestion() {
+        let err = AgentError::timeout("test", 1000);
+        assert!(err.recovery_suggestion().is_some());
+
+        let err = AgentError::internal("test");
+        assert!(err.recovery_suggestion().is_none());
+    }
+
+    #[test]
+    fn test_retry_delay() {
+        let err = AgentError::timeout("test", 1000);
+        assert_eq!(err.retry_delay_ms(), Some(500));
+
+        let err = AgentError::recoverable("test", "test");
+        assert_eq!(err.retry_delay_ms(), Some(1000));
+
+        let err = AgentError::internal("test");
+        assert!(err.retry_delay_ms().is_none());
     }
 }

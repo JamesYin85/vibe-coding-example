@@ -6,6 +6,7 @@ pub mod decomposer;
 pub mod error;
 pub mod llm;
 pub mod logging;
+pub mod retry;
 
 pub use agent::{Agent, BaseAgent, AgentState, SubTask, Task, Output};
 pub use capability::{Capability, CapabilityRegistry};
