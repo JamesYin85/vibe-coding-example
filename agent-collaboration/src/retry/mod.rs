@@ -6,6 +6,7 @@
 //! - **Retry policies** with configurable backoff strategies
 //! - **Circuit breaker** pattern to prevent cascading failures
 //! - **Retry executor** for async operations with automatic retries
+//! - **Generic error support** via the `RetryableError` trait
 //!
 //! # Quick Start
 //!
@@ -73,7 +74,12 @@
 pub mod policy;
 pub mod circuit_breaker;
 pub mod executor;
+pub mod trait_;
 
+pub use trait_::RetryableError;
 pub use policy::{RetryPolicy, BackoffStrategy, RetryConfig};
 pub use circuit_breaker::{CircuitBreaker, CircuitState, CircuitBreakerConfig};
-pub use executor::{RetryExecutor, RetryResult, RetryExecutorBuilder};
+pub use executor::{
+    RetryExecutor, RetryResult, RetryExecutorBuilder,
+    AgentRetryExecutor, AgentRetryResult, AgentRetryExecutorBuilder,
+};

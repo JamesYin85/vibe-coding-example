@@ -302,6 +302,32 @@ impl AgentError {
     }
 }
 
+impl crate::retry::RetryableError for AgentError {
+    fn is_retryable(&self) -> bool {
+        self.should_retry()
+    }
+
+    fn is_timeout(&self) -> bool {
+        matches!(self, AgentError::Timeout { .. })
+    }
+
+    fn is_transient(&self) -> bool {
+        self.is_recoverable()
+    }
+
+    fn retry_after(&self) -> Option<std::time::Duration> {
+        self.retry_delay_ms().map(std::time::Duration::from_millis)
+    }
+
+    fn to_error_message(&self) -> String {
+        self.to_string()
+    }
+
+    fn create_timeout_error(operation: &str, duration_ms: u64) -> Self {
+        AgentError::timeout(operation, duration_ms)
+    }
+}
+
 pub type Result<T> = std::result::Result<T, AgentError>;
 
 #[cfg(test)]

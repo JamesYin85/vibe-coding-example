@@ -27,34 +27,44 @@
 //!         eprintln!("Failed after {} attempts: {}", attempts, error);
 //!     }
 //!     RetryResult::Cancelled => println!("Operation cancelled"),
+//!     RetryResult::CircuitOpen { .. } => println!("Circuit breaker is open"),
 //! }
 //! # Ok(())
 //! # }
 //! ```
 
-use crate::error::{AgentError, Result};
+use crate::error::AgentError;
+use crate::retry::circuit_breaker::CircuitBreaker;
 use crate::retry::policy::{BackoffStrategy, RetryConfig, RetryPolicy};
+use crate::retry::trait_::RetryableError;
 use std::future::Future;
+use std::marker::PhantomData;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn, instrument};
 
 /// Result of a retry operation
 #[derive(Debug)]
-pub enum RetryResult<T> {
+pub enum RetryResult<T, E: RetryableError = AgentError> {
     /// Operation succeeded
     Success(T),
     /// Operation failed after all retries
     Failed {
-        error: AgentError,
+        error: E,
         attempts: u32,
         last_delay_ms: Option<u64>,
+    },
+    /// Circuit breaker is open, request was blocked
+    CircuitOpen {
+        error: Option<E>,
     },
     /// Operation was cancelled
     Cancelled,
 }
 
-impl<T> RetryResult<T> {
+impl<T, E: RetryableError> RetryResult<T, E> {
     pub fn is_success(&self) -> bool {
         matches!(self, RetryResult::Success(_))
     }
@@ -63,10 +73,21 @@ impl<T> RetryResult<T> {
         matches!(self, RetryResult::Failed { .. })
     }
 
+    pub fn is_circuit_open(&self) -> bool {
+        matches!(self, RetryResult::CircuitOpen { .. })
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        matches!(self, RetryResult::Cancelled)
+    }
+
     pub fn unwrap(self) -> T {
         match self {
             RetryResult::Success(value) => value,
-            RetryResult::Failed { error, .. } => panic!("Called unwrap on a failed result: {}", error),
+            RetryResult::Failed { error, .. } => {
+                panic!("Called unwrap on a failed result: {}", error.to_error_message())
+            }
+            RetryResult::CircuitOpen { .. } => panic!("Called unwrap on a circuit open result"),
             RetryResult::Cancelled => panic!("Called unwrap on a cancelled result"),
         }
     }
@@ -77,19 +98,40 @@ impl<T> RetryResult<T> {
             _ => default,
         }
     }
+
+    /// Map the success value to a new type
+    pub fn map<U, F: FnOnce(T) -> U>(self, f: F) -> RetryResult<U, E> {
+        match self {
+            RetryResult::Success(value) => RetryResult::Success(f(value)),
+            RetryResult::Failed { error, attempts, last_delay_ms } => {
+                RetryResult::Failed { error, attempts, last_delay_ms }
+            }
+            RetryResult::CircuitOpen { error } => RetryResult::CircuitOpen { error },
+            RetryResult::Cancelled => RetryResult::Cancelled,
+        }
+    }
 }
 
-/// Retry executor for operations that may fail
-pub struct RetryExecutor {
+/// Type alias for backward compatibility with existing code using AgentError
+pub type AgentRetryResult<T> = RetryResult<T, AgentError>;
+
+/// Generic retry executor for operations that may fail
+pub struct RetryExecutor<E: RetryableError = AgentError> {
     policy: RetryPolicy,
     config: RetryConfig,
+    circuit_breaker: Option<Arc<CircuitBreaker>>,
+    cancellation_token: Option<CancellationToken>,
+    _phantom: PhantomData<E>,
 }
 
-impl RetryExecutor {
+impl<E: RetryableError> RetryExecutor<E> {
     pub fn new(config: RetryConfig) -> Self {
         Self {
             policy: RetryPolicy::new(config.clone()),
             config,
+            circuit_breaker: None,
+            cancellation_token: None,
+            _phantom: PhantomData,
         }
     }
 
@@ -97,7 +139,35 @@ impl RetryExecutor {
         Self {
             policy,
             config: RetryConfig::default(),
+            circuit_breaker: None,
+            cancellation_token: None,
+            _phantom: PhantomData,
         }
+    }
+
+    /// Check if cancellation has been requested
+    fn is_cancelled(&self) -> bool {
+        self.cancellation_token.as_ref().map_or(false, |t| t.is_cancelled())
+    }
+
+    /// Wait for delay with cancellation support
+    async fn wait_with_cancellation(&self, delay: Duration) -> bool {
+        if let Some(token) = &self.cancellation_token {
+            tokio::select! {
+                _ = sleep(delay) => false,
+                _ = token.cancelled() => true,
+            }
+        } else {
+            sleep(delay).await;
+            false
+        }
+    }
+
+    /// Check if we should retry based on error
+    fn should_retry(&self, error: &E) -> bool {
+        error.is_retryable()
+            || (self.config.retry_on_timeout && error.is_timeout())
+            || (self.config.retry_on_transient && error.is_transient())
     }
 
     /// Execute an async operation with retry logic
@@ -106,15 +176,36 @@ impl RetryExecutor {
         &self,
         operation_name: &str,
         operation: F,
-    ) -> RetryResult<T>
+    ) -> RetryResult<T, E>
     where
         F: Fn() -> Fut,
-        Fut: Future<Output = Result<T>>,
+        Fut: Future<Output = std::result::Result<T, E>>,
     {
+        // Check cancellation at start
+        if self.is_cancelled() {
+            return RetryResult::Cancelled;
+        }
+
+        // Check circuit breaker
+        if let Some(cb) = &self.circuit_breaker {
+            if !cb.is_call_allowed() {
+                warn!(
+                    operation_name = %operation_name,
+                    "Circuit breaker is open, request blocked"
+                );
+                return RetryResult::CircuitOpen { error: None };
+            }
+        }
+
         let mut attempts = 0;
         let mut last_delay_ms = None;
 
         loop {
+            // Check cancellation before each attempt
+            if self.is_cancelled() {
+                return RetryResult::Cancelled;
+            }
+
             attempts += 1;
 
             debug!(
@@ -130,14 +221,23 @@ impl RetryExecutor {
                         attempts = attempts,
                         "Operation succeeded"
                     );
+                    // Record success to circuit breaker
+                    if let Some(cb) = &self.circuit_breaker {
+                        cb.record_success();
+                    }
                     return RetryResult::Success(result);
                 }
                 Err(error) => {
+                    // Record failure to circuit breaker
+                    if let Some(cb) = &self.circuit_breaker {
+                        cb.record_failure();
+                    }
+
                     // Check if we should retry
-                    if !self.policy.should_retry(&error) {
+                    if !self.should_retry(&error) {
                         warn!(
                             operation_name = %operation_name,
-                            error = %error,
+                            error = %error.to_error_message(),
                             "Non-retryable error"
                         );
                         return RetryResult::Failed {
@@ -152,7 +252,7 @@ impl RetryExecutor {
                         warn!(
                             operation_name = %operation_name,
                             attempts = attempts,
-                            error = %error,
+                            error = %error.to_error_message(),
                             "Max retries exceeded"
                         );
                         return RetryResult::Failed {
@@ -162,7 +262,7 @@ impl RetryExecutor {
                         };
                     }
 
-                    // Calculate delay and wait
+                    // Calculate delay
                     let delay = self.policy.config().calculate_delay(attempts);
                     last_delay_ms = Some(delay.as_millis() as u64);
 
@@ -170,11 +270,14 @@ impl RetryExecutor {
                         operation_name = %operation_name,
                         attempt = attempts,
                         delay_ms = delay.as_millis(),
-                        error = %error,
+                        error = %error.to_error_message(),
                         "Retrying after delay"
                     );
 
-                    sleep(delay).await;
+                    // Wait with cancellation support
+                    if self.wait_with_cancellation(delay).await {
+                        return RetryResult::Cancelled;
+                    }
                 }
             }
         }
@@ -186,21 +289,41 @@ impl RetryExecutor {
         &self,
         operation_name: &str,
         operation: F,
-    ) -> RetryResult<T>
+    ) -> RetryResult<T, E>
     where
         F: Fn() -> Fut,
-        Fut: Future<Output = Result<T>>,
+        Fut: Future<Output = std::result::Result<T, E>>,
     {
         if self.config.attempt_timeout_ms == 0 {
             return self.execute(operation_name, operation).await;
         }
 
-        let timeout = Duration::from_millis(self.config.attempt_timeout_ms);
+        // Check cancellation at start
+        if self.is_cancelled() {
+            return RetryResult::Cancelled;
+        }
 
+        // Check circuit breaker
+        if let Some(cb) = &self.circuit_breaker {
+            if !cb.is_call_allowed() {
+                warn!(
+                    operation_name = %operation_name,
+                    "Circuit breaker is open, request blocked"
+                );
+                return RetryResult::CircuitOpen { error: None };
+            }
+        }
+
+        let timeout = Duration::from_millis(self.config.attempt_timeout_ms);
         let mut attempts = 0;
         let mut last_delay_ms = None;
 
         loop {
+            // Check cancellation before each attempt
+            if self.is_cancelled() {
+                return RetryResult::Cancelled;
+            }
+
             attempts += 1;
 
             debug!(
@@ -217,14 +340,23 @@ impl RetryExecutor {
                         attempts = attempts,
                         "Operation succeeded"
                     );
+                    // Record success to circuit breaker
+                    if let Some(cb) = &self.circuit_breaker {
+                        cb.record_success();
+                    }
                     return RetryResult::Success(result);
                 }
                 Ok(Err(error)) => {
+                    // Record failure to circuit breaker
+                    if let Some(cb) = &self.circuit_breaker {
+                        cb.record_failure();
+                    }
+
                     // Check if we should retry
-                    if !self.policy.should_retry(&error) {
+                    if !self.should_retry(&error) {
                         warn!(
                             operation_name = %operation_name,
-                            error = %error,
+                            error = %error.to_error_message(),
                             "Non-retryable error"
                         );
                         return RetryResult::Failed {
@@ -238,7 +370,7 @@ impl RetryExecutor {
                         warn!(
                             operation_name = %operation_name,
                             attempts = attempts,
-                            error = %error,
+                            error = %error.to_error_message(),
                             "Max retries exceeded"
                         );
                         return RetryResult::Failed {
@@ -255,19 +387,22 @@ impl RetryExecutor {
                         operation_name = %operation_name,
                         attempt = attempts,
                         delay_ms = delay.as_millis(),
-                        error = %error,
+                        error = %error.to_error_message(),
                         "Retrying after delay"
                     );
 
-                    sleep(delay).await;
+                    // Wait with cancellation support
+                    if self.wait_with_cancellation(delay).await {
+                        return RetryResult::Cancelled;
+                    }
                 }
                 Err(_) => {
-                    // Timeout
-                    let error = AgentError::timeout(
-                        operation_name,
-                        self.config.attempt_timeout_ms,
-                    );
+                    // Record failure to circuit breaker
+                    if let Some(cb) = &self.circuit_breaker {
+                        cb.record_failure();
+                    }
 
+                    // Timeout - create error using trait method
                     if !self.config.retry_on_timeout || attempts >= self.config.max_retries {
                         warn!(
                             operation_name = %operation_name,
@@ -275,7 +410,7 @@ impl RetryExecutor {
                             "Operation timed out"
                         );
                         return RetryResult::Failed {
-                            error,
+                            error: E::create_timeout_error(operation_name, self.config.attempt_timeout_ms),
                             attempts,
                             last_delay_ms,
                         };
@@ -291,22 +426,34 @@ impl RetryExecutor {
                         "Retrying after timeout"
                     );
 
-                    sleep(delay).await;
+                    // Wait with cancellation support
+                    if self.wait_with_cancellation(delay).await {
+                        return RetryResult::Cancelled;
+                    }
                 }
             }
         }
     }
 }
 
+/// Type alias for backward compatibility
+pub type AgentRetryExecutor = RetryExecutor<AgentError>;
+
 /// Builder for creating retry executors
-pub struct RetryExecutorBuilder {
+pub struct RetryExecutorBuilder<E: RetryableError = AgentError> {
     config: RetryConfig,
+    circuit_breaker: Option<Arc<CircuitBreaker>>,
+    cancellation_token: Option<CancellationToken>,
+    _phantom: PhantomData<E>,
 }
 
-impl RetryExecutorBuilder {
+impl<E: RetryableError> RetryExecutorBuilder<E> {
     pub fn new() -> Self {
         Self {
             config: RetryConfig::default(),
+            circuit_breaker: None,
+            cancellation_token: None,
+            _phantom: PhantomData,
         }
     }
 
@@ -360,16 +507,37 @@ impl RetryExecutorBuilder {
         self
     }
 
-    pub fn build(self) -> RetryExecutor {
-        RetryExecutor::new(self.config)
+    /// Add circuit breaker for resilience
+    pub fn with_circuit_breaker(mut self, cb: Arc<CircuitBreaker>) -> Self {
+        self.circuit_breaker = Some(cb);
+        self
+    }
+
+    /// Add cancellation token for graceful shutdown
+    pub fn with_cancellation_token(mut self, token: CancellationToken) -> Self {
+        self.cancellation_token = Some(token);
+        self
+    }
+
+    pub fn build(self) -> RetryExecutor<E> {
+        RetryExecutor {
+            policy: RetryPolicy::new(self.config.clone()),
+            config: self.config,
+            circuit_breaker: self.circuit_breaker,
+            cancellation_token: self.cancellation_token,
+            _phantom: PhantomData,
+        }
     }
 }
 
-impl Default for RetryExecutorBuilder {
+impl<E: RetryableError> Default for RetryExecutorBuilder<E> {
     fn default() -> Self {
         Self::new()
     }
 }
+
+/// Type alias for backward compatible builder
+pub type AgentRetryExecutorBuilder = RetryExecutorBuilder<AgentError>;
 
 #[cfg(test)]
 mod tests {
@@ -435,5 +603,54 @@ mod tests {
             .await;
 
         assert!(result.is_failed());
+    }
+
+    #[tokio::test]
+    async fn test_retry_executor_cancellation() {
+        let token = CancellationToken::new();
+        let executor = RetryExecutorBuilder::new()
+            .max_retries(10)
+            .base_delay(100)
+            .with_cancellation_token(token.clone())
+            .build();
+
+        // Cancel immediately
+        token.cancel();
+
+        let result = executor
+            .execute("test_op", || async {
+                Err::<i32, _>(AgentError::timeout("test", 100))
+            })
+            .await;
+
+        assert!(result.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn test_retry_executor_circuit_breaker() {
+        let cb = Arc::new(CircuitBreaker::with_defaults());
+
+        // Trip the circuit breaker
+        for _ in 0..5 {
+            cb.record_failure();
+        }
+
+        let executor = RetryExecutorBuilder::new()
+            .max_retries(3)
+            .with_circuit_breaker(cb)
+            .build();
+
+        let result = executor
+            .execute("test_op", || async { Ok::<_, AgentError>(42) })
+            .await;
+
+        assert!(result.is_circuit_open());
+    }
+
+    #[tokio::test]
+    async fn test_retry_result_map() {
+        let result: RetryResult<i32, AgentError> = RetryResult::Success(42);
+        let mapped = result.map(|x| x * 2);
+        assert_eq!(mapped.unwrap(), 84);
     }
 }

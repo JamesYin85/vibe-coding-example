@@ -120,4 +120,42 @@ impl LLMError {
     }
 }
 
+impl crate::retry::RetryableError for LLMError {
+    fn is_retryable(&self) -> bool {
+        self.is_retryable()
+    }
+
+    fn is_timeout(&self) -> bool {
+        matches!(self, LLMError::Timeout { .. })
+    }
+
+    fn is_transient(&self) -> bool {
+        matches!(
+            self,
+            LLMError::RateLimited { .. }
+            | LLMError::ServiceUnavailable
+            | LLMError::NetworkError { .. }
+            | LLMError::ModelOverloaded { .. }
+        )
+    }
+
+    fn retry_after(&self) -> Option<Duration> {
+        match self {
+            LLMError::RateLimited { retry_after } => *retry_after,
+            LLMError::Timeout { seconds } => Some(Duration::from_secs(*seconds)),
+            _ => None,
+        }
+    }
+
+    fn to_error_message(&self) -> String {
+        self.user_message()
+    }
+
+    fn create_timeout_error(operation: &str, duration_ms: u64) -> Self {
+        LLMError::Timeout {
+            seconds: duration_ms / 1000,
+        }
+    }
+}
+
 pub type LLMResult<T> = std::result::Result<T, LLMError>;

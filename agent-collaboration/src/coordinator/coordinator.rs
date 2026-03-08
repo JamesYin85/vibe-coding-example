@@ -6,6 +6,7 @@
 use crate::agent::{Agent, BaseAgent, Output, SubTask, Task, AgentState};
 use crate::capability::CapabilityRegistry;
 use crate::communication::Message;
+use crate::coordinator::result::{ParallelExecutionResult, SubtaskResult};
 use crate::decomposer::{
     AgentAssigner, AgentInfo, AssignmentStrategy,
     HybridStrategy, TaskAnalysis, TaskAnalyzer, DecomposeStrategy,
@@ -13,6 +14,7 @@ use crate::decomposer::{
 use crate::error::{AgentError, Result};
 use crate::llm::{FallbackClient, LLMConfig};
 use async_trait::async_trait;
+use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -35,6 +37,10 @@ pub struct ExecutionResult {
     pub agent_outputs: HashMap<String, Output>,
     pub summary: Value,
     pub success: bool,
+    /// Failed subtasks with error details
+    pub failed_subtasks: Vec<SubtaskResult>,
+    /// Whether this was a partial success (some succeeded, some failed)
+    pub partial_success: bool,
 }
 
 /// Coordinator configuration
@@ -43,6 +49,11 @@ pub struct CoordinatorConfig {
     pub use_llm_for_decomposition: bool,
     pub parallel_execution: bool,
     pub max_agents: usize,
+    /// Maximum number of subtasks to execute concurrently
+    pub max_concurrent_subtasks: usize,
+    /// If true, return immediately on first error (old behavior)
+    /// If false, continue executing and collect partial results
+    pub fail_fast: bool,
 }
 
 impl Default for CoordinatorConfig {
@@ -51,6 +62,8 @@ impl Default for CoordinatorConfig {
             use_llm_for_decomposition: false,
             parallel_execution: true,
             max_agents: 10,
+            max_concurrent_subtasks: 4,
+            fail_fast: false,
         }
     }
 }
@@ -189,8 +202,92 @@ impl Coordinator {
     }
 
     /// Execute all subtasks (parallel or sequential based on config)
+    /// Returns ParallelExecutionResult with both successes and failures
+    #[instrument(skip(self, subtasks))]
+    async fn execute_subtasks_with_partial_failure(
+        &self,
+        subtasks: &[SubTask],
+    ) -> ParallelExecutionResult {
+        let total = subtasks.len();
+
+        if self.config.parallel_execution {
+            // Execute with bounded concurrency using buffer_unordered
+            let results: Vec<SubtaskResult> = stream::iter(subtasks.iter())
+                .map(|subtask| async {
+                    let agent_id = subtask.assigned_to.clone().unwrap_or_default();
+                    match self.execute_subtask(subtask).await {
+                        Ok(output) => SubtaskResult::success(
+                            subtask.id.clone(),
+                            agent_id,
+                            output,
+                        ),
+                        Err(e) => SubtaskResult::failure(
+                            subtask.id.clone(),
+                            agent_id,
+                            e.to_string(),
+                        ),
+                    }
+                })
+                .buffer_unordered(self.config.max_concurrent_subtasks)
+                .collect()
+                .await;
+
+            ParallelExecutionResult::from_results(results)
+        } else {
+            // Execute sequentially, collecting results
+            let mut execution_result = ParallelExecutionResult::with_capacity(total);
+
+            for subtask in subtasks {
+                let agent_id = subtask.assigned_to.clone().unwrap_or_default();
+                match self.execute_subtask(subtask).await {
+                    Ok(output) => {
+                        execution_result.add_success(subtask.id.clone(), output);
+                    }
+                    Err(e) => {
+                        execution_result.add_failure(SubtaskResult::failure(
+                            subtask.id.clone(),
+                            agent_id,
+                            e.to_string(),
+                        ));
+                    }
+                }
+            }
+
+            execution_result
+        }
+    }
+
+    /// Execute all subtasks (parallel or sequential based on config)
+    /// Legacy method that fails fast on first error for backward compatibility
     #[instrument(skip(self, subtasks))]
     async fn execute_subtasks(
+        &self,
+        subtasks: &[SubTask],
+    ) -> Result<HashMap<String, Output>> {
+        // Use fail_fast mode if configured
+        if self.config.fail_fast {
+            self.execute_subtasks_fail_fast(subtasks).await
+        } else {
+            // Use partial failure handling, but return error if all failed
+            let result = self.execute_subtasks_with_partial_failure(subtasks).await;
+
+            if result.is_complete_failure() {
+                // Return the first error
+                if let Some(failed) = result.failed.first() {
+                    if let Some(error_msg) = &failed.error_message {
+                        return Err(AgentError::internal(error_msg));
+                    }
+                }
+                return Err(AgentError::internal("All subtasks failed"));
+            }
+
+            Ok(result.successful)
+        }
+    }
+
+    /// Execute subtasks with fail-fast behavior (legacy)
+    #[instrument(skip(self, subtasks))]
+    async fn execute_subtasks_fail_fast(
         &self,
         subtasks: &[SubTask],
     ) -> Result<HashMap<String, Output>> {
@@ -324,6 +421,8 @@ impl Coordinator {
             agent_outputs,
             summary: json!(null),
             success: true,
+            failed_subtasks: Vec::new(),
+            partial_success: false,
         };
 
         result.summary = self.generate_summary(&result);
@@ -382,6 +481,8 @@ impl Coordinator {
             agent_outputs,
             summary: json!(null),
             success: true,
+            failed_subtasks: Vec::new(),
+            partial_success: false,
         };
 
         result.summary = self.generate_summary(&result);
