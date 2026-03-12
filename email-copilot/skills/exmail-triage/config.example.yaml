@@ -1,0 +1,42 @@
+imap_host: "imap.exmail.qq.com"
+imap_port: 993
+imap_ssl: true
+email_address: "me@company.com"
+password_env_var: "EXMAIL_PASSWORD"
+interval_minutes: 15
+llm_provider: "glm"
+llm_api_key_env_var: "ZAI_API_KEY"
+llm_base_url: "https://open.bigmodel.cn/api/paas/v4"
+model: "glm-5"
+display_name: "工作邮箱摘要"
+aliases:
+  - "me@company.com"
+  - "my.alias@company.com"
+  - "james"
+important_senders:
+  - "ceo@company.com"
+  - "pm@company.com"
+important_keywords:
+  - "请处理"
+  - "urgent"
+  - "action required"
+  - "请尽快"
+general_keywords:
+  - "FYI"
+  - "知悉"
+  - "会议纪要"
+  - "通知"
+useless_senders:
+  - "newsletter@vendor.com"
+  - "noreply"
+  - "no-reply"
+useless_keywords:
+  - "unsubscribe"
+  - "订阅"
+  - "promotion"
+  - "digest"
+output_dir: "/Users/yourname/exmail-triage/reports"
+archive_dir: "/Users/yourname/exmail-triage/archive"
+state_db_path: "/Users/yourname/exmail-triage/state/triage.sqlite3"
+timezone: "Asia/Shanghai"
+max_emails_per_run: 50

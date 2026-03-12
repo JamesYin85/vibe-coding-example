@@ -1,0 +1,4 @@
+interface:
+  display_name: "Exmail 邮件分级"
+  short_description: "汇总并分类 Exmail 收件箱轮询结果"
+  default_prompt: "使用 $exmail-triage 构建或维护 Exmail IMAP 轮询与摘要自动化。"
